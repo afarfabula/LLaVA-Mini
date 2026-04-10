@@ -200,12 +200,29 @@ class LlavaMiniMetaModel:
             embed_dim=1024,
             num_heads=8,
         )
+        temporal_router_hidden = getattr(config, 'temporal_router_hidden_size', 256)
+        temporal_router_input_dim = getattr(config, 'hidden_size', self.base_model.config.hidden_size)
+        self.temporal_router = nn.Sequential(
+            nn.LayerNorm(temporal_router_input_dim),
+            nn.Linear(temporal_router_input_dim, temporal_router_hidden),
+            nn.GELU(),
+            nn.Linear(temporal_router_hidden, 1),
+        )
+        self.buffer_query = nn.Parameter(torch.randn(16, self.base_model.config.hidden_size) * 0.02)
+        self.buffer_retriever = nn.MultiheadAttention(
+            embed_dim=self.base_model.config.hidden_size,
+            num_heads=getattr(config, 'buffer_retriever_heads', 8),
+            batch_first=True,
+        )
+        self.buffer_retriever_norm = nn.LayerNorm(self.base_model.config.hidden_size)
         if self.base_model.device.type != 'meta':
             self.compressor.to(self.base_model.device).to(self.base_model.dtype)
+            self.temporal_router.to(self.base_model.device).to(self.base_model.dtype)
+            self.buffer_retriever.to(self.base_model.device).to(self.base_model.dtype)
+            self.buffer_retriever_norm.to(self.base_model.device).to(self.base_model.dtype)
+            self.buffer_query.data = self.buffer_query.data.to(self.base_model.device).to(self.base_model.dtype)
         print("#Vision Tokens:",self.compressor_size*self.compressor_size)
         self.load_prefusion_layers=False
-
-
 
     def get_vision_tower(self):
         vision_tower = getattr(self, 'vision_tower', None)
@@ -334,6 +351,66 @@ class LlavaMiniMetaForCausalLM(ABC):
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
+    def _retrieve_buffer_tokens(self, image_features, global_image_features):
+        buffer_source = image_features
+        if buffer_source.size(1) < 16:
+            pad = buffer_source[:, -1:, :].expand(-1, 16 - buffer_source.size(1), -1)
+            buffer_source = torch.cat([buffer_source, pad], dim=1)
+        query = self.get_model().buffer_query.unsqueeze(0).expand(image_features.size(0), -1, -1).type_as(image_features)
+        retrieved_buffer, _ = self.get_model().buffer_retriever(
+            query=query,
+            key=buffer_source,
+            value=buffer_source,
+        )
+        retrieved_buffer = self.get_model().buffer_retriever_norm(retrieved_buffer + query)
+        return retrieved_buffer
+
+    def _build_pyramid_outputs(self, image_features, global_image_features):
+        anchor_tokens = global_image_features[:, :4, :]
+        if anchor_tokens.size(1) < 4:
+            pad = anchor_tokens[:, -1:, :].expand(-1, 4 - anchor_tokens.size(1), -1)
+            anchor_tokens = torch.cat([anchor_tokens, pad], dim=1)
+
+        buffer_tokens = self._retrieve_buffer_tokens(image_features, global_image_features)
+        return anchor_tokens, buffer_tokens
+
+    def _apply_temporal_pruning(self, frame_features, frame_scores=None, keep_frames=None):
+        if frame_features is None or frame_features.ndim != 4:
+            return frame_features, None
+
+        batch_size, temporal_len, token_len, hidden_size = frame_features.shape
+        if temporal_len <= 1:
+            flat_features = frame_features.reshape(batch_size, temporal_len * token_len, hidden_size)
+            single_scores = frame_features.new_ones(batch_size, temporal_len)
+            return flat_features, {
+                'frame_scores': single_scores,
+                'routing_weights': single_scores,
+                'selected_indices': torch.zeros(batch_size, 1, dtype=torch.long, device=frame_features.device),
+                'selected_scores': single_scores,
+            }
+
+        if keep_frames is None:
+            keep_frames = getattr(self.config, 'temporal_pruning_keep_frames', 4)
+        keep_frames = max(1, min(int(keep_frames), temporal_len))
+
+        router_input = frame_features.float().mean(dim=2)
+        router_logits = self.get_model().temporal_router(router_input).squeeze(-1)
+        if frame_scores is not None:
+            router_logits = router_logits + frame_scores.type_as(router_logits)
+        routing_weights = torch.softmax(router_logits, dim=1)
+        topk_weights, topk_indices = torch.topk(routing_weights, k=keep_frames, dim=1)
+        topk_indices, sort_order = torch.sort(topk_indices, dim=1)
+        topk_weights = torch.gather(topk_weights, 1, sort_order)
+        gather_index = topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, token_len, hidden_size)
+        pruned_features = torch.gather(frame_features, 1, gather_index)
+        weighted_features = pruned_features * topk_weights.unsqueeze(-1).unsqueeze(-1).type_as(pruned_features)
+        return weighted_features.reshape(batch_size, keep_frames * token_len, hidden_size), {
+            'frame_scores': router_logits,
+            'routing_weights': routing_weights,
+            'selected_indices': topk_indices,
+            'selected_scores': topk_weights,
+        }
+
     def encode_images_mini(self, images,input_ids,labels=None,modal='image'):
         if modal=='video': 
             # Batch operations on video frames can further improve efficiency and will be implemented in the future.
@@ -365,9 +442,10 @@ class LlavaMiniMetaForCausalLM(ABC):
 
                 compressed_image_features=self.get_model().mm_projector(compressed_image_features)
                 global_image_features=self.get_model().mm_projector(global_image_features)
+                anchor_image_features, buffer_image_features = self._build_pyramid_outputs(compressed_image_features, global_image_features)
 
-                x=torch.cat([global_image_features,compressed_image_features,text_embedding],dim=1)
-                mask=torch.cat((torch.zeros((padding_mask.size(0),global_image_features.size(1)+compressed_image_features.size(1)),device=padding_mask.device).bool(),padding_mask),dim=1)
+                x=torch.cat([anchor_image_features,buffer_image_features,global_image_features,compressed_image_features,text_embedding],dim=1)
+                mask=torch.cat((torch.zeros((padding_mask.size(0),anchor_image_features.size(1)+buffer_image_features.size(1)+global_image_features.size(1)+compressed_image_features.size(1)),device=padding_mask.device).bool(),padding_mask),dim=1)
 
             else:
                 # high resolution
@@ -390,12 +468,13 @@ class LlavaMiniMetaForCausalLM(ABC):
                 compressed_image_features=self.get_model().mm_projector(compressed_image_features)
                 compressed_image_features=compressed_image_features.view(bsz,split_ratio*split_ratio,compressed_image_features.size(-2),compressed_image_features.size(-1)).reshape(bsz,-1,compressed_image_features.size(-1))
                 global_image_features=self.get_model().mm_projector(global_image_features)
+                anchor_image_features, buffer_image_features = self._build_pyramid_outputs(compressed_image_features, global_image_features)
 
                 d=global_image_features.size(-1)
                 hd_image_features_all=self.get_model().mm_projector(clip_image_features[:,:-1]).view(bsz,hd_ratio,hd_ratio,org_grid,org_grid,-1).transpose(2,3).reshape(bsz,-1,d)
 
-                x=torch.cat([hd_image_features_all,global_image_features,compressed_image_features,text_embedding],dim=1)
-                mask=torch.cat((torch.zeros((padding_mask.size(0),hd_image_features_all.size(1)+global_image_features.size(1)+compressed_image_features.size(1)),device=padding_mask.device).bool(),padding_mask),dim=1)
+                x=torch.cat([anchor_image_features,buffer_image_features,hd_image_features_all,global_image_features,compressed_image_features,text_embedding],dim=1)
+                mask=torch.cat((torch.zeros((padding_mask.size(0),anchor_image_features.size(1)+buffer_image_features.size(1)+hd_image_features_all.size(1)+global_image_features.size(1)+compressed_image_features.size(1)),device=padding_mask.device).bool(),padding_mask),dim=1)
 
             if getattr(self.get_model().base_model, "_use_flash_attention_2", False) or getattr(self.get_model().base_model.config, "_attn_implementation", "") == "flash_attention_2":
                 attention_mask=(~mask).int()
@@ -408,7 +487,7 @@ class LlavaMiniMetaForCausalLM(ABC):
 
             # modality pre-fusion
             for layer in self.get_model().prefusion_layers:
-                x = layer(x,attention_mask=attention_mask,position_ids=position_ids)[0]
+                x = layer(x, attention_mask=attention_mask, position_ids=position_ids)[0]
 
             fusion_text_features=x[:,-1*input_ids.size(1):,:]
             compressed_image_features=x[:,-1*input_ids.size(1)-1*compressed_image_features.size(1):-1*input_ids.size(1),:]
@@ -441,7 +520,9 @@ class LlavaMiniMetaForCausalLM(ABC):
                         frame_image_features,frame_text_features = self.encode_images_mini(image[:,frame_idx],input_ids[i:i+1],labels[i:i+1] if labels is not None else None)
                         image_features_list.append(frame_image_features)
                         text_features_sum=text_features_sum+frame_text_features.float()
-                    image_features.append(torch.cat(image_features_list,dim=1).squeeze(0))
+                    stacked_frame_features = torch.stack(image_features_list, dim=1)
+                    pruned_image_features, _ = self._apply_temporal_pruning(stacked_frame_features)
+                    image_features.append(pruned_image_features.squeeze(0))
                     text_features.append((text_features_sum/temporal_len).squeeze(0).type_as(frame_text_features))
 
 
@@ -455,13 +536,13 @@ class LlavaMiniMetaForCausalLM(ABC):
                 temporal_len=images.size(1)
                 image_features_list = []
                 text_features_sum = 0
-                with  torch.no_grad():
-                    for frame_idx in range(temporal_len):
-                        frame_image_features,frame_text_features = self.encode_images_mini(images[:,frame_idx],input_ids=input_ids,labels=labels)
-                        image_features_list.append(frame_image_features)
-                        text_features_sum=text_features_sum+frame_text_features.float()
-                image_features=torch.cat(image_features_list,dim=1).requires_grad_()
-                text_features=(text_features_sum/temporal_len).type_as(frame_text_features).requires_grad_()
+                for frame_idx in range(temporal_len):
+                    frame_image_features,frame_text_features = self.encode_images_mini(images[:,frame_idx],input_ids=input_ids,labels=labels)
+                    image_features_list.append(frame_image_features)
+                    text_features_sum=text_features_sum+frame_text_features.float()
+                stacked_frame_features = torch.stack(image_features_list, dim=1)
+                image_features, temporal_pruning_info = self._apply_temporal_pruning(stacked_frame_features)
+                text_features=(text_features_sum/temporal_len).type_as(frame_text_features)
 
             else:
                 image_features,text_features = self.encode_images_mini(images,input_ids=input_ids,labels=labels)

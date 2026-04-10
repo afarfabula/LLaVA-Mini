@@ -40,8 +40,13 @@ from llavamini.mm_utils import tokenizer_image_token
 from PIL import Image
 
 import numpy as np
-import decord
-from decord import VideoReader, cpu
+try:
+    import decord
+    from decord import VideoReader, cpu
+except ImportError:
+    decord = None
+    VideoReader = None
+    cpu = None
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -75,6 +80,7 @@ class ModelArguments:
     compressor_size: Optional[int] = field(default=2)
     resolution_ratio:int = field(default=2)
     prefusion_layer_num: Optional[int] = field(default=4)
+    temporal_router_hidden_size: Optional[int] = field(default=256)
 
 
 @dataclass
@@ -1688,6 +1694,16 @@ def train(attn_implementation=None):
             for p in model.get_model().compressor.parameters():
                 p.requires_grad = True
 
+            for p in model.get_model().temporal_router.parameters():
+                p.requires_grad = True
+
+            model.get_model().buffer_query.requires_grad = True
+            for p in model.get_model().buffer_retriever.parameters():
+                p.requires_grad = True
+
+            for p in model.get_model().buffer_retriever_norm.parameters():
+                p.requires_grad = True
+
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
@@ -1700,6 +1716,16 @@ def train(attn_implementation=None):
             for p in model.get_model().compressor.parameters():
                 p.requires_grad = False
 
+            for p in model.get_model().temporal_router.parameters():
+                p.requires_grad = False
+
+            model.get_model().buffer_query.requires_grad = False
+            for p in model.get_model().buffer_retriever.parameters():
+                p.requires_grad = False
+
+            for p in model.get_model().buffer_retriever_norm.parameters():
+                p.requires_grad = False
+
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
@@ -1709,6 +1735,7 @@ def train(attn_implementation=None):
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.config.compressor_size = model_args.compressor_size
         model.config.prefusion_layer_num = model_args.prefusion_layer_num
+        model.config.temporal_router_hidden_size = getattr(model_args, "temporal_router_hidden_size", 256)
         model.config.resolution_ratio = data_args.resolution_ratio = model_args.resolution_ratio
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
