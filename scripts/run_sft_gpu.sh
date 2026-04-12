@@ -1,11 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT=/home/tiger/zero_to_n_workspace/LLaVA-Mini
-cd /home/tiger/zero_to_n_workspace/LLaVA-Mini
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "$ROOT"
 
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-export PYTHONPATH=/home/tiger/zero_to_n_workspace/LLaVA-Mini:
+export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_DEBUG=warn
 export OMP_NUM_THREADS=8
@@ -17,14 +18,14 @@ NODE_RANK=0
 MASTER_ADDR=127.0.0.1
 MASTER_PORT=29500
 
-MODEL_NAME_OR_PATH=/home/tiger/zero_to_n_workspace/LLaVA-Mini/data/mock_model
+MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-${ROOT}/data/mock_model}"
 VISION_TOWER=openai/clip-vit-large-patch14
 PRETRAIN_MM_MLP_ADAPTER=
-DATA_PATHS=/home/tiger/zero_to_n_workspace/LLaVA-Mini/data/mock_train.json
-IMAGE_FOLDERS=/home/tiger/zero_to_n_workspace/LLaVA-Mini/data/mock_images
-OUTPUT_DIR=/home/tiger/zero_to_n_workspace/LLaVA-Mini/data/mock_output_h20
+DATA_PATHS="${DATA_PATHS:-${ROOT}/data/mock_train.json}"
+IMAGE_FOLDERS="${IMAGE_FOLDERS:-${ROOT}/data/mock_images}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT}/data/mock_output_h20}"
 PROMPT_VERSION=plain
-DEEPSPEED_CONFIG=/home/tiger/zero_to_n_workspace/LLaVA-Mini/scripts/zero2.json
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-${ROOT}/scripts/zero2.json}"
 MAX_STEPS=3
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=1

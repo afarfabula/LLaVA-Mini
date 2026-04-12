@@ -1,17 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT=/home/tiger/zero_to_n_workspace/LLaVA-Mini
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${SCRIPT_DIR}"
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export WANDB_DISABLED=true
 export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
-export PYTHONPATH=:
+export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
+export ROOT
 
 python3 - <<'PY'
 import os
 import runpy
 import sys
-root = '/home/tiger/zero_to_n_workspace/LLaVA-Mini'
+root = os.environ["ROOT"]
 if root not in sys.path:
     sys.path.insert(0, root)
 

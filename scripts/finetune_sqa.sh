@@ -2,12 +2,16 @@
 
 # IMPORTANT: this is the training script for the original LLaVA, NOT FOR LLaVA V1.5!
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCIENCEQA_ROOT="${SCIENCEQA_ROOT:-${ROOT}/playground/data/scienceqa}"
+
 deepspeed llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path lmsys/vicuna-13b-v1.3 \
     --version $PROMPT_VERSION \
-    --data_path /Data/ScienceQA/data/scienceqa/llava_train_QCM-LEA.json \
-    --image_folder /Data/ScienceQA/data/scienceqa/images/train \
+    --data_path "${SCIENCEQA_ROOT}/llava_train_QCM-LEA.json" \
+    --image_folder "${SCIENCEQA_ROOT}/images/train" \
     --vision_tower openai/clip-vit-large-patch14 \
     --pretrain_mm_mlp_adapter ./checkpoints/huggingface/liuhaotian/llava-pretrain-vicuna-13b-v1.3/mm_projector.bin \
     --mm_vision_select_layer -2 \

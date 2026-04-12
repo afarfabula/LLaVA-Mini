@@ -30,7 +30,7 @@ except ImportError:
     GradientAccumulationPlugin = None
 
 if is_accelerate_available():
-    from accelerate import Accelerator, skip_first_batches, InitProcessGroupKwargs
+    from accelerate import Accelerator, skip_first_batches, InitProcessGroupKwargs, DataLoaderConfiguration
 
 if is_datasets_available():
     import datasets
@@ -38,16 +38,23 @@ if is_datasets_available():
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
-    from deepspeed import zero
-    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-    if hasattr(param, "ds_id"):
-        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-            if not ignore_status:
-                print(name, 'no ignore status')
-        with zero.GatheredParameters([param]):
-            param = param.data.detach().cpu().clone()
-    else:
-        param = param.detach().cpu().clone()
+    if not hasattr(param, "ds_id"):
+        return param.detach().cpu().clone()
+
+    try:
+        from deepspeed import zero
+        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Parameter {name or '<unknown>'} appears to be managed by DeepSpeed ZeRO, "
+            "but DeepSpeed is not installed."
+        ) from exc
+
+    if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+        if not ignore_status:
+            print(name, 'no ignore status')
+    with zero.GatheredParameters([param]):
+        param = param.data.detach().cpu().clone()
     return param
 
 
@@ -158,13 +165,29 @@ class LLaVATrainer(Trainer):
         grad_acc_kwargs["sync_with_dataloader"] = False
         gradient_accumulation_plugin = GradientAccumulationPlugin(**grad_acc_kwargs) if GradientAccumulationPlugin is not None else None
 
-        accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
+        ddp_backend = os.environ.get("LLAVAMINI_DDP_BACKEND", "nccl")
+        accelerator_kwargs = InitProcessGroupKwargs(
+            timeout=timedelta(weeks=52),
+            backend=ddp_backend,
+        )
+        dataloader_config = None
+        accelerator_config = getattr(self.args, "accelerator_config", None)
+        if accelerator_config is not None and is_accelerate_available("0.28.0"):
+            accelerator_config_dict = accelerator_config.to_dict()
+            dataloader_config = DataLoaderConfiguration(
+                split_batches=accelerator_config_dict.pop("split_batches"),
+                dispatch_batches=accelerator_config_dict.pop("dispatch_batches"),
+                even_batches=accelerator_config_dict.pop("even_batches"),
+                use_seedable_sampler=accelerator_config_dict.pop("use_seedable_sampler"),
+            )
         accelerator_init_kwargs = {
             "deepspeed_plugin": self.args.deepspeed_plugin,
             "kwargs_handlers": [accelerator_kwargs],
         }
         if gradient_accumulation_plugin is not None:
             accelerator_init_kwargs["gradient_accumulation_plugin"] = gradient_accumulation_plugin
+        if dataloader_config is not None:
+            accelerator_init_kwargs["dataloader_config"] = dataloader_config
 
         self.accelerator = Accelerator(**accelerator_init_kwargs)
         self.gather_function = self.accelerator.gather_for_metrics
@@ -211,10 +234,11 @@ class LLaVATrainer(Trainer):
 
         train_dataset = self.train_dataset
         data_collator = self.data_collator
-        if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
-            train_dataset = self._remove_unused_columns(train_dataset, description="training")
-        else:
-            data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
+        if self.args.remove_unused_columns:
+            if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
+                train_dataset = self._remove_unused_columns(train_dataset, description="training")
+            else:
+                data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
 
         dataloader_params = {
             "batch_size": self._train_batch_size,
@@ -230,9 +254,14 @@ class LLaVATrainer(Trainer):
             dataloader_params["worker_init_fn"] = seed_worker
             dataloader_params["prefetch_factor"] = self.args.dataloader_num_workers * 2 if self.args.dataloader_num_workers != 0 else None
 
-        dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
+        dataloader = DataLoader(train_dataset, **dataloader_params)
 
-        return dataloader
+        # The single-process smoke path is valid with the raw DataLoader, while
+        # accelerate's DataLoader wrapping can yield a None batch on this setup.
+        if self.args.world_size <= 1:
+            return dataloader
+
+        return self.accelerator.prepare(dataloader)
     def create_optimizer(self):
         """
         Setup the optimizer.

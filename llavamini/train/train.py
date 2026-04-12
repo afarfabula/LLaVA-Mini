@@ -58,6 +58,13 @@ def rank0_print(*args):
         print(*args)
 
 
+def local_only_kwargs(model_path):
+    path = pathlib.Path(model_path)
+    if path.exists():
+        return {"local_files_only": True}
+    return {}
+
+
 from packaging import version
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
 
@@ -136,16 +143,16 @@ class TrainingArguments(transformers.TrainingArguments):
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
+    if not hasattr(param, "ds_id"):
+        return param.detach().cpu().clone()
+
     from deepspeed import zero
     from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-    if hasattr(param, "ds_id"):
-        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-            if not ignore_status:
-                logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
-        with zero.GatheredParameters([param]):
-            param = param.data.detach().cpu().clone()
-    else:
-        param = param.detach().cpu().clone()
+    if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+        if not ignore_status:
+            logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
+    with zero.GatheredParameters([param]):
+        param = param.data.detach().cpu().clone()
     return param
 
 
@@ -1369,7 +1376,7 @@ class LazySupervisedDataset(Dataset):
                 print(f"Error: {e}")
                 print(self.list_data_dict[i])
                 # assert False
-                i=random.randint(0, len(self.list_data_dict))
+                i=random.randint(0, len(self.list_data_dict) - 1)
 
 
         '''
@@ -1457,7 +1464,7 @@ class LazySupervisedDataset(Dataset):
 
             except:
                 print(self.list_data_dict[i])
-                i=random.randint(0, len(self.list_data_dict))
+                i=random.randint(0, len(self.list_data_dict) - 1)
         '''
         if data_dict is None:
             data_dict = preprocess(
@@ -1561,12 +1568,17 @@ def train(attn_implementation=None):
 
     if model_args.vision_tower is not None:
         if 'mpt' in model_args.model_name_or_path:
-            config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
+            config = transformers.AutoConfig.from_pretrained(
+                model_args.model_name_or_path,
+                trust_remote_code=True,
+                **local_only_kwargs(model_args.model_name_or_path),
+            )
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
             model = LlavaMptForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 config=config,
                 cache_dir=training_args.cache_dir,
+                **local_only_kwargs(model_args.model_name_or_path),
                 **bnb_model_from_pretrained_args
             )
         else:
@@ -1575,6 +1587,7 @@ def train(attn_implementation=None):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                **local_only_kwargs(model_args.model_name_or_path),
                 **bnb_model_from_pretrained_args
             )
     else:
@@ -1583,6 +1596,7 @@ def train(attn_implementation=None):
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            **local_only_kwargs(model_args.model_name_or_path),
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
@@ -1631,7 +1645,8 @@ def train(attn_implementation=None):
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
-            padding_side="right"
+            padding_side="right",
+            **local_only_kwargs(model_args.model_name_or_path),
         )
     else:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -1640,6 +1655,7 @@ def train(attn_implementation=None):
             model_max_length=training_args.model_max_length,
             padding_side="right",
             use_fast=False,
+            **local_only_kwargs(model_args.model_name_or_path),
         )
 
     if model_args.version == "v0":

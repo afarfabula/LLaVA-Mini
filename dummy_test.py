@@ -4,7 +4,7 @@ import sys
 import types
 import torch
 
-ROOT = pathlib.Path('/home/tiger/zero_to_n_workspace/LLaVA-Mini')
+ROOT = pathlib.Path(__file__).resolve().parent
 MODULE_PATH = ROOT / 'llavamini' / 'model' / 'llavamini_arch.py'
 
 

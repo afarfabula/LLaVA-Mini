@@ -1,7 +1,14 @@
 import torch
 import torch.nn as nn
+from pathlib import Path
 
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
+
+
+def local_only_kwargs(model_path):
+    if Path(model_path).exists():
+        return {"local_files_only": True}
+    return {}
 
 
 class CLIPVisionTower(nn.Module):
@@ -19,15 +26,25 @@ class CLIPVisionTower(nn.Module):
         elif getattr(args, 'unfreeze_mm_vision_tower', False):
             self.load_model()
         else:
-            self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
+            self.cfg_only = CLIPVisionConfig.from_pretrained(
+                self.vision_tower_name,
+                **local_only_kwargs(self.vision_tower_name),
+            )
 
     def load_model(self, device_map=None):
         if self.is_loaded:
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
             return
 
-        self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        self.image_processor = CLIPImageProcessor.from_pretrained(
+            self.vision_tower_name,
+            **local_only_kwargs(self.vision_tower_name),
+        )
+        self.vision_tower = CLIPVisionModel.from_pretrained(
+            self.vision_tower_name,
+            device_map=device_map,
+            **local_only_kwargs(self.vision_tower_name),
+        )
         self.vision_tower.requires_grad_(False)
 
         self.is_loaded = True
@@ -115,8 +132,15 @@ class CLIPVisionTowerS2(CLIPVisionTower):
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
             return
 
-        self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        self.image_processor = CLIPImageProcessor.from_pretrained(
+            self.vision_tower_name,
+            **local_only_kwargs(self.vision_tower_name),
+        )
+        self.vision_tower = CLIPVisionModel.from_pretrained(
+            self.vision_tower_name,
+            device_map=device_map,
+            **local_only_kwargs(self.vision_tower_name),
+        )
         self.vision_tower.requires_grad_(False)
 
         self.image_processor.size['shortest_edge'] = self.s2_image_size
