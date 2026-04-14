@@ -47,6 +47,8 @@ GROUP_BY_MODALITY_LENGTH="${GROUP_BY_MODALITY_LENGTH:-True}"
 BF16="${BF16:-True}"
 TF32="${TF32:-True}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
+DDP_BACKEND="${DDP_BACKEND:-}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-1}"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -82,7 +84,7 @@ TRAIN_ENTRY=(llavamini/train/train.py
   --evaluation_strategy no
   --save_strategy steps
   --save_steps "${MAX_STEPS}"
-  --save_total_limit 2
+  --save_total_limit "${SAVE_TOTAL_LIMIT}"
   --learning_rate "${LEARNING_RATE}"
   --max_grad_norm 0.5
   --weight_decay 0.0
@@ -95,6 +97,10 @@ TRAIN_ENTRY=(llavamini/train/train.py
   --lazy_preprocess True
   --report_to none
   --max_steps "${MAX_STEPS}")
+
+if [[ -n "${DDP_BACKEND}" ]]; then
+  TRAIN_ENTRY+=(--ddp_backend "${DDP_BACKEND}")
+fi
 
 
 if [[ "${GPUS}" == "1" && "${SINGLE_PROCESS}" == "1" ]]; then

@@ -102,11 +102,18 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 class Resampler(nn.Module):
-    """
+    """ 
     A 2D perceiver-resampler network with one cross attention layers by
         (grid_size**2) learnable queries and 2d sincos pos_emb
     Outputs:
         A tensor with the shape of (grid_size**2, embed_dim)
+
+    中文说明（与视频/图像 token 压缩相关）：
+    - 视觉 backbone（比如 ViT）先把一帧图像切成固定网格的 patch token，常见是 24x24=576 个 token。
+    - 这些 576 个 token 作为 K/V 输入到本模块，内部用 "grid_size**2" 个可学习查询（Q）做一次交叉注意力，
+      把所有 patch 的信息汇聚到少量查询 token 上（例如 grid_size=2 时只留下 4 个 token）。
+    - 后续只会保留这 "grid_size**2" 个聚合后的 token，原始的 576 个 patch token 在这里就被压缩/丢弃掉，
+      只通过注意力贡献到这少量 token 的表示中。
     """
     def __init__(
             self,
@@ -423,21 +430,33 @@ class LlavaMiniMetaForCausalLM(ABC):
             
             text_embedding=all_text_embedding
 
+            # images 形状: [bsz, parts, 3, H, W]
+            #   - 对于单张图像或单帧视频，这里通常是 parts == 1；
+            #   - 视觉 backbone 会把每一帧映射成 spa_len 个 patch token，常见 spa_len=24*24=576。
             bsz,parts,rgb,height,width=images.size()
 
             if parts==1:
                 # standard resolution
                 images=images[:,0]
+                # 视觉编码：一帧图像 -> spa_len 个 patch token（比如 576 个）
                 clip_image_features = self.get_model().get_vision_tower()(images)
                 _,spa_len,d_im=clip_image_features.size()
                 clip_image_features=clip_image_features.view(bsz,spa_len,d_im)
 
+                # org_grid 一般是 24，对应 24x24 = 576 个 patch token
                 org_grid=int(math.sqrt(spa_len))
                 split_ratio=1
 
+                # image_features 仍然保留的是一帧的所有 patch token（例如 576 个），
+                # global_image_features 则作为全局特征后面会一起送入 mm_projector。
                 image_features=clip_image_features
                 global_image_features=clip_image_features
-                
+
+                # 关键一步：用 Resampler 做空间压缩
+                #   - compressor 内部以所有 patch token 为 K/V，以少量 learnable query 为 Q 做一次 cross-attention；
+                #   - 输出的 compressed_image_features 只有 grid_size**2 个 token，
+                #     原始的 spa_len（例如 576）个 patch token 不再单独保留下来，
+                #     只通过注意力聚合到这少量 token 里，相当于在这里丢弃了「全量 576 个 token」的显式表示。
                 compressed_image_features,attn=self.get_model().compressor(image_features)
 
                 compressed_image_features=self.get_model().mm_projector(compressed_image_features)
@@ -506,7 +525,10 @@ class LlavaMiniMetaForCausalLM(ABC):
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
         if type(images) is list:
-            # video
+            # video 模式：images 是一个列表，每个元素对应一个样本；
+            #   - images[i].ndim == 5 时，表示该样本是视频，包含 temporal_len 帧；
+            #   - 每一帧会单独调用 encode_images_mini，经由 vision_tower + compressor 从 576 patch token
+            #     压缩成少量聚合 token，然后在时间维度上再做一次帧级剪枝（_apply_temporal_pruning）。
             image_features=[]
             text_features=[]
             for i in range(len(images)):
@@ -516,10 +538,18 @@ class LlavaMiniMetaForCausalLM(ABC):
                     temporal_len=image.size(1)
                     image_features_list = []
                     text_features_sum = 0
+                    # 逐帧处理视频：
+                    #   - 第一步：对每一帧调用 encode_images_mini，内部会先得到 spa_len（通常 576）个 patch token，
+                    #     再通过 compressor 压缩成少量 token（grid_size**2 个），这一层是「空间维度」上的 token 压缩。
                     for frame_idx in range(temporal_len):
                         frame_image_features,frame_text_features = self.encode_images_mini(image[:,frame_idx],input_ids[i:i+1],labels[i:i+1] if labels is not None else None)
                         image_features_list.append(frame_image_features)
                         text_features_sum=text_features_sum+frame_text_features.float()
+                    # 第二步：把所有帧的压缩后 token 堆叠成 [B, T, token_len, D]，
+                    # 然后交给 _apply_temporal_pruning 在时间维度上做帧级剪枝：
+                    #   - 通过 temporal_router 计算每一帧的重要性分数；
+                    #   - 只保留 top-k 帧（keep_frames），其它帧的所有视觉 token 直接被丢弃；
+                    #   - 这样在空间上已经从 576 -> grid_size**2，在时间上又从 T 帧 -> keep_frames 帧。
                     stacked_frame_features = torch.stack(image_features_list, dim=1)
                     pruned_image_features, _ = self._apply_temporal_pruning(stacked_frame_features)
                     image_features.append(pruned_image_features.squeeze(0))

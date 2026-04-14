@@ -142,6 +142,12 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
+    # NOTE(视频/多帧处理总入口)：
+    #  - 这里同时处理「单张图像」和「多张图像/视频」两种情况。
+    #  - 对于视频输入，通常会先在前面的 vision tower 中把每一帧编码成 patch token，
+    #    比如 24x24 = 576 个视觉 token，然后再在这里按 mm_patch_merge_type 做空间/时间维度的压缩。
+    #  - 下面的逻辑里，并不会一步步展示时序池化的细节（那部分在 vision_tower 的实现里），
+    #    但会决定哪些 patch token 被保留、哪些被丢弃（例如去掉 padding 区域的 token）。
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, image_sizes=None
@@ -150,6 +156,13 @@ class LlavaMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
+        # 对于 list 或 5 维张量：
+        #   - list: 每个元素可以是一张图像，或者「一段视频的多帧」已经在外面堆叠好；
+        #   - 5D:   通常是 [B, T, C, H, W]，T 为时间维度（视频帧数）。
+        # 这里统一视作「一批多帧图像」，先在 batch 维度上 concat，
+        # 再通过 vision_tower + mm_projector 得到视觉 token。
+        # 视觉 backbone 一般会先把每帧映射成固定数量的 patch token（如 24x24=576），
+        # 然后在本函数里再根据 mm_patch_merge_type 做进一步压缩/重排。
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
@@ -159,14 +172,25 @@ class LlavaMetaForCausalLM(ABC):
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
             image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
+            # mm_patch_merge_type 决定「视觉 token 如何展平/压缩」：
+            #   - 'flat' : 直接把所有 patch token 展平成一维序列，不做空间重排；
+            #   - 'spatial*' : 保留空间结构（以及可能的多帧结构），在这里做合并/去 padding。
             if mm_patch_merge_type == 'flat':
                 image_features = [x.flatten(0, 1) for x in image_features]
             elif mm_patch_merge_type.startswith('spatial'):
                 new_image_features = []
+                # 这里处理 anyres + spatial 的情况，典型场景是：
+                #   - 视觉 backbone 先把图像/视频帧 resize 成固定大小，再切成固定网格（例如 24x24=576 token）；
+                #   - 为了匹配任意分辨率，需要把「只属于 padding 区域」的 token 丢弃掉，
+                #     只保留真实图像区域对应的 token，从而完成一次 token 压缩。
                 for image_idx, image_feature in enumerate(image_features):
                     if image_feature.shape[0] > 1:
+                        # image_feature[0] 是第一帧（或基础图像）的 patch token，
+                        # 后面的 image_feature[1:] 可能是其他帧或同一图像在不同 grid 里的块。
                         base_image_feature = image_feature[0]
                         image_feature = image_feature[1:]
+                        # num_patches_per_side 一般是 24，所以 height * width = 24 * 24 = 576，
+                        # 对应「一帧图像」在视觉 backbone 输出的全量 patch token 数量。
                         height = width = self.get_vision_tower().num_patches_per_side
                         assert height * width == base_image_feature.shape[0]
                         if image_aspect_ratio == 'anyres':
@@ -175,6 +199,14 @@ class LlavaMetaForCausalLM(ABC):
                         else:
                             raise NotImplementedError
                         if 'unpad' in mm_patch_merge_type:
+                            # 关键步骤：unpad + image_newline
+                            #   1. 先把 token 重新排列成 [C, H_total, W_total]，其中 H_total/W_total 是多帧/多块拼接后的网格；
+                            #   2. 调用 unpad_image，根据原始分辨率 image_sizes[image_idx] 把「属于 padding 区域」的 token 切掉；
+                            #      —— 这一步就是把最初 24x24=576 个 token 中「纯 padding」对应的那部分丢弃掉，
+                            #         只保留真实图像区域的 token，相当于对视觉 token 做了一次压缩。
+                            #   3. 在每一行末尾拼接一个 image_newline token，标记类似于「换行符」，
+                            #      方便下游模型感知到空间布局的分段。
+                            #   4. 最后再展平成 [num_tokens_after_unpad, C] 的序列，供语言模型消费。
                             image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
                             image_feature = image_feature.flatten(1, 2).flatten(2, 3)
                             image_feature = unpad_image(image_feature, image_sizes[image_idx])
